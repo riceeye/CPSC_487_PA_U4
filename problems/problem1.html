@@ -20,8 +20,9 @@
 </head>
 <body>
 <script type="module">
-    import {ThreeEngine} from "../js/utils/utils_three.js";
+    import {ThreeEngine, get_default_lil_gui, refresh_displays} from "../js/utils/utils_three.js";
     import {B1Z1Robot, XArm7Robot} from "../js/utils/utils_robot.js";
+    import {identity_matrix, mul_matrix_matrix, add_matrix_matrix, mul_matrix_scalar} from "../js/utils/utils_math.js";
 
     // todo: create a visualization that demonstrates your knowledge of forward kinematics on a robot model.
     // todo: The "default" assignment is to recreate this visualization:
@@ -43,8 +44,136 @@
     // this will spawn all of the robot's links at the origin
     robot.spawn_robot(engine);
 
-    engine.animation_loop( ()  => {
+    let gui = get_default_lil_gui();
 
+    let links = robot.links;
+    let joints = robot.joints;
+    let kh = robot.kinematic_hierarchy;
+
+    let dof_settings = {
+    }
+    let dofs_folder = gui.addFolder('DOFs');
+    for(let i = 0; i < joints.length; i++) {
+        if(joints[i].joint_type_string === 'revolute' || joints[i].joint_type_string === 'prismatic') {
+            dof_settings["dof" + joints[i].dof_idx.toString()] = 0.0;
+            dofs_folder.add(dof_settings, 'dof' + joints[i].dof_idx.toString(), joints[i].lower_bound, joints[i].upper_bound);
+        }
+        else if(joints[i].joint_type_string === 'floating') {
+            joints[i].rotation_dof_idxs.forEach(dof => {
+                dof_settings["dof" + dof.toString()] = 0.0;
+                dofs_folder.add(dof_settings, 'dof' + dof.toString(), -Math.PI, Math.PI);
+            });
+            joints[i].translation_dof_idxs.forEach(dof => {
+                dof_settings["dof" + dof.toString()] = 0.0;
+                dofs_folder.add(dof_settings, 'dof' + dof.toString(), -1, 1);
+            });
+        }
+    }
+
+    let actions = {
+        reset: function() {
+            for(let dof in dof_settings) {
+                dof_settings[dof] = 0.0;
+            }
+            refresh_displays(gui);
+        },
+    };
+
+    let actions_folder = gui.addFolder('Actions');
+    actions_folder.add(actions, 'reset').name('Reset');
+
+    function SO3_create(v, epsilon=0.0001) {
+        let A = [[0, -v[2], v[1]],
+                 [v[2], 0, -v[0]],
+                 [-v[1], v[0], 0]];
+
+        let beta = Math.sqrt(Math.pow(v[0], 2) + Math.pow(v[1], 2) + Math.pow(v[2], 2));
+        let p, q;
+        if (beta < epsilon) {
+            p = 1 - Math.pow(beta, 2) / 6 + Math.pow(beta, 4) / 120;
+            q = 0.5 - Math.pow(beta, 2) / 24 + Math.pow(beta, 4) / 720;
+        }
+        else {
+            p = Math.sin(beta) / beta;
+            q = (1 - Math.cos(beta)) / Math.pow(beta, 2);
+        }
+
+        return add_matrix_matrix(add_matrix_matrix(identity_matrix(3), mul_matrix_scalar(A, p)), mul_matrix_scalar(mul_matrix_matrix(A, A), q));
+    }
+
+    function Tv_create_revolute(angle, axis, epsilon=0.0001) {
+        let r = SO3_create(mul_matrix_scalar(axis, angle));
+
+        return [[r[0][0], r[0][1], r[0][2], 0],
+                [r[1][0], r[1][1], r[1][2], 0],
+                [r[2][0], r[2][1], r[2][2], 0],
+                [0, 0, 0, 1]];
+    }
+
+    function Tv_create_prismatic(angle, axis) {
+        return [[1, 0, 0, angle*axis[0]],
+                [0, 1, 0, angle*axis[1]],
+                [0, 0, 1, angle*axis[2]],
+                [0, 0, 0, 1]];
+    }
+
+    function Tv_create_floating(rotation, translation, epsilon=0.0001) {
+        let r = SO3_create(rotation);
+        return [[r[0][0], r[0][1], r[0][2], translation[0]],
+                [r[1][0], r[1][1], r[1][2], translation[1]],
+                [r[2][0], r[2][1], r[2][2], translation[2]],
+                [0, 0, 0, 1]];
+    }
+
+    engine.animation_loop( ()  => {
+        let fk_poses = [];
+        for(let i = 0; i < links.length; i++) {
+            fk_poses.push( identity_matrix(4) );
+        }
+
+        kh.forEach(layer => {
+            layer.forEach(link_idx => {
+                let curr_link = links[link_idx];
+                let parent_link_idx = curr_link.parent_link_idx;
+                let parent_joint_idx = curr_link.parent_joint_idx;
+                if(parent_joint_idx === null) {
+                    return;
+                }
+                let curr_joint = joints[parent_joint_idx];
+                let joint_type = curr_joint.joint_type_string;
+
+                let curr_pose = fk_poses[parent_link_idx];
+                let T_c = curr_joint.xyz_rpy_SE3_matrix;
+                curr_pose = mul_matrix_matrix(curr_pose, T_c);
+
+                let T_v = identity_matrix(4);
+                if(joint_type === 'revolute') {
+                    let joint_value = dof_settings["dof" + curr_joint.dof_idx.toString()];
+                    let axis = curr_joint.axis;
+                    T_v = Tv_create_revolute(joint_value, axis);
+                }
+                else if(joint_type === 'prismatic') {
+                    let joint_value = dof_settings["dof" + curr_joint.dof_idx.toString()];
+                    let axis = curr_joint.axis;
+                    T_v = Tv_create_prismatic(joint_value, axis);
+                }
+                else if(joint_type === 'floating') {
+                    let rd = curr_joint.rotation_dof_idxs;
+                    let td = curr_joint.translation_dof_idxs;
+
+                    let rv = [ dof_settings["dof" + rd[0].toString()], dof_settings["dof" + rd[1].toString()], dof_settings["dof" + rd[2].toString()] ];
+                    let tv = [ dof_settings["dof" + td[0].toString()], dof_settings["dof" + td[1].toString()], dof_settings["dof" + td[2].toString()] ];
+
+                    T_v = Tv_create_floating(rv, tv);
+                }
+
+                curr_pose = mul_matrix_matrix(curr_pose, T_v);
+
+                fk_poses[link_idx] = curr_pose;
+            });
+        });
+
+        links.forEach(link => robot.set_link_mesh_pose_from_SE3_matrix(engine, link.link_idx, fk_poses[link.link_idx]));
     });
 
 </script>
